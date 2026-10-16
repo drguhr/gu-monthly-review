@@ -161,9 +161,7 @@
     const b = S.data.bank[role];
     const filled = scores.filter(v => v !== null && v !== undefined).length;
     if (b.type === 'staff') {
-      return { filled, n: b.questions.length,
-        needComment: scores.some(v => v === 5 || (v !== null && v !== undefined && v <= 2)),
-        why: '有題目給 5 分或 1–2 分，請具體說明事實（必填）' };
+      return { filled, n: b.questions.length, needComment: false, why: '', optional: '選填，可作為紀錄。' };
     }
     return { filled, n: b.questions.length, needComment: false, why: '', optional: '選填，可作為紀錄。' };
   }
@@ -281,7 +279,7 @@
       document.getElementById('stat').innerHTML = editable ? `已填 <b>${c.filled}</b> / ${c.n}` : '';
       const hint = document.getElementById('cHint');
       hint.className = 'hint' + (c.needComment && editable ? ' req' : '');
-      hint.textContent = !editable ? '' : c.needComment ? c.why : (c.optional || '選填。給 5 分或 1–2 分時必填。');
+      hint.textContent = !editable ? '' : c.needComment ? c.why : c.optional;
       const btn = document.getElementById('submit');
       if (btn) btn.disabled = c.filled < c.n || (c.needComment && comment.trim().length < 5);
       if (editable) store.set(o.draftKey, { scores, comment });
