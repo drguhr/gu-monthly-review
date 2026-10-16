@@ -146,3 +146,10 @@ input.input:focus, select.input:focus, textarea.input:focus { outline: 3px solid
 /* 唯讀（覆核）時只顯示選取的選項，畫面較短 */
 .ro .opts .opt:not([aria-pressed="true"]) { display: none; }
 .ro .q { padding-bottom: 12px; }
+
+/* v2：覆核調整 */
+.banner.amber { background: var(--amber-soft); color: var(--amber); }
+.adj-tag { display: inline-block; margin-left: 8px; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--amber-soft); color: var(--amber); vertical-align: middle; }
+.row .right .adj-tag { margin-left: 0; }
+.adj-note { font-size: 13px; color: var(--amber); margin: -4px 0 10px; }
+.q.adjusted { border-color: #d9a441; box-shadow: 0 0 0 2px #f6e3bd; }

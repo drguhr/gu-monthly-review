@@ -25,7 +25,6 @@
     t.textContent = msg; t.className = 'toast show' + (bad ? ' bad' : '');
     clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.className = 'toast'; }, 3200);
   }
-  const fmt = n => (n === '' || n === null || n === undefined) ? '-' : (Math.round(Number(n) * 100) / 100).toFixed(1);
 
   async function api(action, body) {
     if (!API || API.indexOf('請貼上') >= 0) throw new Error('尚未設定 API 網址（config.js）');
@@ -72,7 +71,7 @@
 
   function logout(expired) {
     if (S.token && !expired) api('logout').catch(() => {});
-    S.token = null; S.me = null; S.data = null; sess.del();
+    S.token = null; S.me = null; S.data = null; S.month = null; S.tab = 'eval'; sess.del();
     renderLogin(expired ? '登入已逾時，請重新登入' : '');
   }
 
@@ -84,8 +83,11 @@
   // ───── 首頁 ─────
   async function loadHome(month) {
     app.innerHTML = '<p class="muted center pad">載入中…</p>';
+    const tokenAtStart = S.token;
     try {
-      S.data = await api('bootstrap', { month: month || S.month });
+      const data = await api('bootstrap', { month: month || S.month });
+      if (S.token !== tokenAtStart) return; // 載入途中已登出或換帳號
+      S.data = data;
       S.month = S.data.month; S.me = S.data.me;
       renderWho(); renderHome();
     } catch (err) {
@@ -100,11 +102,11 @@
     const d = S.data;
     const hasEval = d.toEvaluate.length > 0;
     const hasReview = d.queue.length > 0 || d.history.length > 0;
-    if (S.tab === 'eval' && !hasEval && hasReview) S.tab = 'queue';
     const done = d.toEvaluate.filter(p => p.status !== '未填寫' && p.status !== '退回').length;
     const tabs = [];
     if (hasEval) tabs.push(['eval', '我要評核', d.toEvaluate.length - done]);
     if (hasReview) { tabs.push(['queue', '待我覆核', d.queue.length]); tabs.push(['history', '覆核紀錄', d.history.length]); }
+    if (tabs.length && !tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
 
     let body = '';
     if (!tabs.length) body = '<div class="empty">這個月份沒有需要你評核或覆核的人員。<br>如果名單有誤，請聯絡人資。</div>';
@@ -140,7 +142,7 @@
             <div><div class="name">${esc(p.name)}</div>
               <div class="sub">${esc(p.empId)}・${esc(p.role)}</div>
               ${p.returnReason ? `<div class="note">退回：${esc(p.returnReason)}</div>` : ''}</div>
-            <div class="right">${pill(p.status)}</div>
+            <div class="right">${p.adjusted ? '<span class="adj-tag">已調整</span>' : ''}${pill(p.status)}</div>
           </button>`).join('')}</div>`).join('')}`;
   }
 
@@ -150,31 +152,20 @@
       <button class="row" data-rec="${esc(r.id)}">
         <div><div class="name">${esc(r.name)}</div>
           <div class="sub">${esc(r.month)}・${esc(r.branch)}・${esc(r.role)}・評核人 ${esc(r.rater)}${r.submittedAt ? '・' + esc(r.submittedAt) : ''}</div></div>
-        <div class="right"><span class="pts">${r.total !== '' ? '總分 ' + esc(r.total) + '・' : ''}點值 ${fmt(r.points)}</span>${pill(r.status)}</div>
+        <div class="right">${r.adjusted ? '<span class="adj-tag">已調整</span>' : ''}${pill(r.status)}</div>
       </button>`).join('')}</div>`;
   }
 
-  // ───── 計算（與後端相同規則，僅供預覽） ─────
-  function calc(role, scores) {
+  // ───── 填寫進度與紀實規則（網頁端只檢查填寫進度） ─────
+  function check(role, scores) {
     const b = S.data.bank[role];
-    const filled = scores.filter(s => s !== null && s !== undefined).length;
+    const filled = scores.filter(v => v !== null && v !== undefined).length;
     if (b.type === 'staff') {
-      const flt = scores.reduce((a, s, i) => a + (s ? b.questions[i].pts[s - 1] : 0), 0);
-      return {
-        filled, n: b.questions.length, points: Math.max(0, Math.round((1 + flt) * 100) / 100), total: null,
-        needComment: scores.some(s => s === 5 || (s !== null && s <= 2)),
-        why: '有題目給 5 分或 1–2 分，請具體說明事實（必填）',
-      };
+      return { filled, n: b.questions.length,
+        needComment: scores.some(v => v === 5 || (v !== null && v !== undefined && v <= 2)),
+        why: '有題目給 5 分或 1–2 分，請具體說明事實（必填）' };
     }
-    const total = scores.reduce((a, s) => a + (s || 0), 0);
-    let points = 1;
-    if (total <= 0) points = 0;
-    else for (const t of b.tiers) { if (total >= t[0]) { points = t[1]; break; } }
-    return {
-      filled, n: b.questions.length, points, total,
-      needComment: filled === b.questions.length && (total >= 90 || total < 70),
-      why: '總分 90 分以上或 70 分以下，請具體說明事實（必填）',
-    };
+    return { filled, n: b.questions.length, needComment: false, why: '', optional: '選填，可作為紀錄。' };
   }
 
   // ───── 評核表單 ─────
@@ -188,53 +179,91 @@
     const draftKey = 'gu_draft_' + S.me.account + '_' + S.month + '_' + empId;
     const bank = S.data.bank[p.role];
     const editable = p.editable;
-    let scores = rec ? rec.scores.slice() : bank.questions.map(() => null);
+    // 可編輯時從評核人自己的原始分數開始；唯讀時顯示最後（覆核後）分數
+    let scores = rec ? (editable ? rec.raterScores : rec.scores).slice() : bank.questions.map(() => null);
     let comment = rec ? rec.comment : '';
     const draft = editable ? store.get(draftKey) : null;
     if (draft && draft.scores && draft.scores.length === bank.questions.length) { scores = draft.scores; comment = draft.comment || ''; }
 
-    renderForm({
-      person: p, bank, scores, comment, editable, draftKey,
-      banner: p.status === '退回' ? `<div class="banner red">退回原因：${esc(p.returnReason)}</div>`
-        : (!editable && rec ? `<div class="banner info">這筆評核目前狀態為「${esc(rec.status)}」，已進入覆核流程，無法修改。</div>` : '')
-        + (draft && editable ? '<div class="banner info">已載入上次未送出的草稿。</div>' : ''),
-    });
+    let banner = '';
+    if (p.status === '退回') banner = `<div class="banner red">退回原因：${esc(p.returnReason)}</div>`;
+    else if (!editable && rec) banner = `<div class="banner info">這筆評核目前狀態為「${esc(rec.status)}」，已進入覆核流程，無法修改。</div>`;
+    if (rec && !editable) banner += adjustBanner(rec);
+    if (draft && editable) banner += '<div class="banner info">已載入上次未送出的草稿。</div>';
+
+    renderForm({ person: p, bank, scores, comment, editable, draftKey, banner,
+      marks: rec && !editable ? marksFor(rec) : {} });
   }
 
-  function questionHTML(bank, q, i, s, ro) {
+  /** 覆核人調整過的題目：{題號: '說明文字'} */
+  function marksFor(rec) {
+    const m = {};
+    if (!rec.adjustments || !rec.adjustments.length) return m;
+    rec.scores.forEach((v, i) => {
+      const steps = [];
+      let prev = rec.raterScores[i];
+      rec.adjustments.forEach(a => {
+        if (a.scores && a.scores[i] !== prev) { steps.push(`${a.by}調整為 ${a.scores[i]}`); prev = a.scores[i]; }
+      });
+      if (steps.length) m[i] = `評核人原評 ${rec.raterScores[i]} 分 → ` + steps.join(' → ');
+    });
+    return m;
+  }
+
+  function adjustBanner(rec) {
+    if (!rec.adjustments || !rec.adjustments.length) return '';
+    return rec.adjustments.map(a =>
+      `<div class="banner amber"><b>${esc(a.by)}調整了分數</b>（標示「已調整」的題目）<br>說明：${esc(a.note)}</div>`).join('');
+  }
+
+  function questionHTML(bank, q, i, s, ro, mark) {
+    const tag = mark ? `<span class="adj-tag">已調整</span>` : '';
+    const note = mark ? `<div class="adj-note">${esc(mark)}</div>` : '';
     if (bank.type === 'staff') {
-      const opts = [5, 4, 3, 2, 1].map(v => {
-        const pt = q.pts[v - 1];
-        return `<button type="button" class="opt" data-q="${i}" data-v="${v}" aria-pressed="${s === v}" ${ro ? 'disabled' : ''}>
-          <span class="sc">${v}</span><span class="tx">${esc(q.crit[v - 1])}</span><span class="pt">點值 ${pt > 0 ? '+' : ''}${pt}</span></button>`;
-      }).join('');
-      return `<div class="q" id="q${i}"><div class="q-title">${i + 1}. ${esc(q.name)}</div><div class="opts">${opts}</div></div>`;
+      const opts = [5, 4, 3, 2, 1].map(v =>
+        `<button type="button" class="opt" data-q="${i}" data-v="${v}" aria-pressed="${s === v}" ${ro ? 'disabled' : ''}>
+          <span class="sc">${v}</span><span class="tx">${esc(q.crit[v - 1])}</span></button>`).join('');
+      return `<div class="q${mark ? ' adjusted' : ''}" id="q${i}"><div class="q-title">${i + 1}. ${esc(q.name)}${tag}</div>${note}<div class="opts">${opts}</div></div>`;
     }
     const chips = Array.from({ length: q.max + 1 }, (_, v) => q.max - v).map(v =>
       `<button type="button" class="chip" data-q="${i}" data-v="${v}" aria-pressed="${s === v}" ${ro ? 'disabled' : ''}>${v}</button>`).join('');
-    return `<div class="q" id="q${i}"><div class="q-title">${i + 1}. ${esc(q.name)} <small>滿分 ${q.max}</small></div>
+    return `<div class="q${mark ? ' adjusted' : ''}" id="q${i}"><div class="q-title">${i + 1}. ${esc(q.name)} <small>滿分 ${q.max}</small>${tag}</div>${note}
       <div class="chips">${chips}</div>
-      <ul class="guide">${q.guide.map(g => `<li>${esc(g)}</li>`).join('')}</ul></div>`;
+      ${ro ? '' : `<ul class="guide">${q.guide.map(g => `<li>${esc(g)}</li>`).join('')}</ul>`}</div>`;
   }
 
-  function questionsHTML(bank, scores, ro) {
+  function questionsHTML(bank, scores, ro, marks) {
     let html = '', lastCat = null;
     bank.questions.forEach((q, i) => {
       if (q.cat !== lastCat) { html += `<div class="cat">${esc(q.cat)}</div>`; lastCat = q.cat; }
-      html += questionHTML(bank, q, i, scores[i], ro);
+      html += questionHTML(bank, q, i, scores[i], ro, (marks || {})[i]);
     });
     return html;
   }
 
+  /** 綁定選分按鈕；onPick(i, v) 每次選分後呼叫 */
+  function bindPicks(scores, onPick) {
+    app.querySelectorAll('[data-q]').forEach(b => {
+      b.onclick = () => {
+        const i = Number(b.dataset.q), v = Number(b.dataset.v);
+        scores[i] = v;
+        app.querySelectorAll(`[data-q="${i}"]`).forEach(x => x.setAttribute('aria-pressed', String(Number(x.dataset.v) === v)));
+        document.getElementById('q' + i).classList.remove('missing');
+        onPick(i, v);
+      };
+    });
+  }
+
   function renderForm(o) {
     const { person: p, bank, editable } = o;
-    let scores = o.scores, comment = o.comment;
+    const scores = o.scores;
+    let comment = o.comment;
     app.innerHTML = `
       <button class="back" id="back">← 返回名單</button>
       <div class="head-card"><h2>${esc(p.name)}</h2>
         <div class="sub">${esc(S.month)}・${esc(p.branch)}・${esc(p.role)}・${esc(p.empId)}</div></div>
       ${o.banner || ''}
-      <div class="${editable ? '' : 'ro'}">${questionsHTML(bank, scores, !editable)}</div>
+      <div class="${editable ? '' : 'ro'}">${questionsHTML(bank, scores, !editable, o.marks)}</div>
       <div class="comment-box">
         <label class="field" for="comment" style="margin-top:0">主管紀實</label>
         ${editable ? `<textarea class="input" id="comment" maxlength="1000" placeholder="請寫具體事實，例如日期、事件、次數">${esc(comment)}</textarea>`
@@ -248,30 +277,21 @@
     document.getElementById('back').onclick = () => renderHome();
 
     const update = () => {
-      const c = calc(p.role, scores);
-      document.getElementById('stat').innerHTML =
-        `已填 <b>${c.filled}</b> / ${c.n}　` + (c.total !== null ? `總分 <b>${c.total}</b>　` : '') + `核算點值 <b>${c.filled === c.n ? fmt(c.points) : '-'}</b>`;
+      const c = check(p.role, scores);
+      document.getElementById('stat').innerHTML = editable ? `已填 <b>${c.filled}</b> / ${c.n}` : '';
       const hint = document.getElementById('cHint');
-      hint.className = 'hint' + (c.needComment ? ' req' : '');
-      hint.textContent = c.needComment ? c.why : (editable ? '選填。給 5 分或 1–2 分時必填。' : '');
+      hint.className = 'hint' + (c.needComment && editable ? ' req' : '');
+      hint.textContent = !editable ? '' : c.needComment ? c.why : (c.optional || '選填。給 5 分或 1–2 分時必填。');
       const btn = document.getElementById('submit');
       if (btn) btn.disabled = c.filled < c.n || (c.needComment && comment.trim().length < 5);
       if (editable) store.set(o.draftKey, { scores, comment });
     };
 
     if (editable) {
-      app.querySelectorAll('[data-q]').forEach(b => {
-        b.onclick = () => {
-          const i = Number(b.dataset.q), v = Number(b.dataset.v);
-          scores[i] = v;
-          app.querySelectorAll(`[data-q="${i}"]`).forEach(x => x.setAttribute('aria-pressed', String(Number(x.dataset.v) === v)));
-          document.getElementById('q' + i).classList.remove('missing');
-          update();
-        };
-      });
+      bindPicks(scores, update);
       document.getElementById('comment').oninput = e => { comment = e.target.value; update(); };
       document.getElementById('submit').onclick = async () => {
-        const firstMissing = scores.findIndex(s => s === null);
+        const firstMissing = scores.findIndex(v => v === null || v === undefined);
         if (firstMissing >= 0) {
           document.getElementById('q' + firstMissing).classList.add('missing');
           document.getElementById('q' + firstMissing).scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -282,7 +302,7 @@
         try {
           const out = await api('submit', { month: S.month, empId: p.empId, scores, comment });
           store.del(o.draftKey);
-          toast(`已送出：${p.name}，核算點值 ${fmt(out.points)}（${out.status}）`);
+          toast(`已送出：${p.name}（${out.status}）`);
           await loadHome(S.month);
         } catch (err) {
           toast(err.message, true); btn.disabled = false; btn.textContent = '送出評核';
@@ -292,44 +312,80 @@
     update();
   }
 
-  // ───── 覆核 ─────
+  // ───── 覆核（可直接調整分數） ─────
   async function openReview(id) {
     app.innerHTML = '<p class="muted center pad">載入中…</p>';
     let rec;
     try { rec = (await api('record', { id })).record; } catch (err) { toast(err.message, true); return renderHome(); }
-    const bank = S.data.bank[rec.role];
     const canAct = S.data.queue.some(q => q.id === id);
-    const c = calc(rec.role, rec.scores);
+    renderReview(rec, canAct, false);
+  }
+
+  function renderReview(rec, canAct, adjusting) {
+    const bank = S.data.bank[rec.role];
+    const base = rec.scores.slice();          // 目前版本（評核人或上一關調整後）
+    const scores = rec.scores.slice();         // 這次覆核要送出的版本
+    const approveLabel = rec.status === '待核定' ? '核定' : '覆核通過';
     app.innerHTML = `
       <button class="back" id="back">← 返回</button>
       <div class="head-card"><h2>${esc(rec.name)} ${pill(rec.status)}</h2>
         <div class="sub">${esc(rec.month)}・${esc(rec.branch)}・${esc(rec.role)}・評核人 ${esc(rec.rater)}・送出 ${esc(rec.submittedAt)}</div></div>
-      <div class="ro">${questionsHTML(bank, rec.scores, true)}</div>
-      <div class="comment-box"><div class="field" style="margin-top:0">主管紀實</div>
+      ${adjustBanner(rec)}
+      ${adjusting ? '<div class="banner info"><b>調整模式</b>：直接點選你認為正確的分數，改過的題目會標示出來。送出時需填寫調整說明，評核人的原始分數仍會保留。</div>' : ''}
+      <div class="${adjusting ? '' : 'ro'}" id="qs">${questionsHTML(bank, scores, !adjusting, marksFor(rec))}</div>
+      <div class="comment-box"><div class="field" style="margin-top:0">主管紀實（評核人）</div>
         <div class="readonly-text">${esc(rec.comment) || '（無）'}</div>
-        ${canAct ? `<label class="field" for="reason">退回原因（退回時必填）</label>
-          <textarea class="input" id="reason" placeholder="例如：遲到次數請附打卡紀錄"></textarea>` : ''}
+        ${canAct ? `<label class="field" for="note">${adjusting ? '調整說明（必填）' : '退回原因（退回時必填）'}</label>
+          <textarea class="input" id="note" placeholder="${adjusting ? '例如：第 8 題本月有一次耗材缺失，改為 3 分' : '例如：遲到次數請附打卡紀錄'}"></textarea>` : ''}
       </div>
       <div class="dock"><div class="dock-inner">
-        <div class="stat">${c.total !== null ? `總分 <b>${c.total}</b>　` : ''}核算點值 <b>${fmt(rec.points)}</b></div>
-        <div class="actions">${canAct ? `<button class="btn danger" id="ret">退回</button><button class="btn" id="ok">${rec.status === '待核定' ? '核定' : '覆核通過'}</button>` : ''}</div>
+        <div class="stat" id="stat"></div>
+        <div class="actions">${!canAct ? '' : adjusting
+          ? `<button class="btn ghost" id="cancelAdj">取消調整</button><button class="btn" id="ok">送出調整並${approveLabel}</button>`
+          : `<button class="btn danger" id="ret">退回</button><button class="btn ghost" id="adj">調整分數</button><button class="btn" id="ok">${approveLabel}</button>`}</div>
       </div></div>`;
     document.getElementById('back').onclick = () => renderHome();
     if (!canAct) return;
-    const act = async (action) => {
-      const reason = document.getElementById('reason').value.trim();
-      if (action === 'return' && reason.length < 2) { toast('請填寫退回原因', true); document.getElementById('reason').focus(); return; }
+
+    const changed = () => scores.filter((v, i) => v !== base[i]).length;
+    const update = () => {
+      if (!adjusting) return;
+      document.getElementById('stat').innerHTML = `已調整 <b>${changed()}</b> 題`;
+    };
+    if (adjusting) {
+      bindPicks(scores, (i, v) => {
+        const el = document.getElementById('q' + i);
+        el.classList.toggle('adjusted', v !== base[i]);
+        let n = el.querySelector('.adj-mine');
+        if (v !== base[i]) {
+          if (!n) { n = document.createElement('div'); n.className = 'adj-note adj-mine'; el.querySelector('.q-title').after(n); }
+          n.textContent = `原為 ${base[i]} 分 → 你調整為 ${v} 分`;
+        } else if (n) n.remove();
+        update();
+      });
+      document.getElementById('cancelAdj').onclick = () => renderReview(rec, canAct, false);
+    } else {
+      document.getElementById('adj').onclick = () => renderReview(rec, canAct, true);
+      document.getElementById('ret').onclick = () => act('return');
+    }
+    document.getElementById('ok').onclick = () => act('approve');
+    update();
+
+    async function act(action) {
+      const note = document.getElementById('note').value.trim();
+      if (action === 'return' && note.length < 2) { toast('請填寫退回原因', true); document.getElementById('note').focus(); return; }
+      if (action === 'approve' && adjusting && changed() && note.length < 2) { toast('請填寫調整說明', true); document.getElementById('note').focus(); return; }
       app.querySelectorAll('.dock .btn').forEach(b => { b.disabled = true; });
       try {
-        const out = await api(action, { id, reason });
-        toast(`${rec.name}：${out.status}`);
+        const body = action === 'return' ? { id: rec.id, reason: note }
+          : (adjusting ? { id: rec.id, scores, note } : { id: rec.id });
+        const out = await api(action, body);
+        toast(`${rec.name}：${out.status}${out.adjusted ? '（已調整分數）' : ''}`);
         await loadHome(S.month);
       } catch (err) {
         toast(err.message, true); app.querySelectorAll('.dock .btn').forEach(b => { b.disabled = false; });
       }
-    };
-    document.getElementById('ok').onclick = () => act('approve');
-    document.getElementById('ret').onclick = () => act('return');
+    }
   }
 
   // ───── 啟動 ─────
