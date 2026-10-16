@@ -1,4 +1,4 @@
-// 部署 Apps Script 網頁應用程式後，把網址貼在這裡（結尾是 /exec）
+// 月考核 API 網址（Apps Script 網頁應用程式，結尾是 /exec）
 window.APP_CONFIG = {
-  API_URL: 'https://script.google.com/macros/s/請貼上你的部署ID/exec',
+  API_URL: 'https://script.google.com/macros/s/AKfycbxO9zPf36vWuuwDV5fxDYsim4Y0C4S0vjRSbv-U2pfuCFPM5RCWDTO5kOI_7umXAq-Gzw/exec',
 };
